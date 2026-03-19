@@ -297,7 +297,23 @@ class Encoder(nn.Module):
                     module.temporal_cache_state.pop(tid, None)
 
 
-MAX_CHUNK_SIZE=(128 * 1024 ** 2)
+MIN_VRAM_FOR_CHUNK_SCALING = 6 * 1024 ** 3
+MAX_VRAM_FOR_CHUNK_SCALING = 24 * 1024 ** 3
+MIN_CHUNK_SIZE = 32 * 1024 ** 2
+MAX_CHUNK_SIZE = 128 * 1024 ** 2
+
+def get_max_chunk_size(device: torch.device) -> int:
+    total_memory = comfy.model_management.get_total_memory(dev=device)
+
+    if total_memory <= MIN_VRAM_FOR_CHUNK_SCALING:
+        return MIN_CHUNK_SIZE
+    if total_memory >= MAX_VRAM_FOR_CHUNK_SCALING:
+        return MAX_CHUNK_SIZE
+
+    interp = (total_memory - MIN_VRAM_FOR_CHUNK_SCALING) / (
+        MAX_VRAM_FOR_CHUNK_SCALING - MIN_VRAM_FOR_CHUNK_SCALING
+    )
+    return int(MIN_CHUNK_SIZE + interp * (MAX_CHUNK_SIZE - MIN_CHUNK_SIZE))
 
 class Decoder(nn.Module):
     r"""
@@ -457,6 +473,17 @@ class Decoder(nn.Module):
 
         self.gradient_checkpointing = False
 
+        # Precompute output scale factors: (channels, (t_scale, h_scale, w_scale), t_offset)
+        ts, hs, ws, to = 1, 1, 1, 0
+        for block in self.up_blocks:
+            if isinstance(block, DepthToSpaceUpsample):
+                ts *= block.stride[0]
+                hs *= block.stride[1]
+                ws *= block.stride[2]
+                if block.stride[0] > 1:
+                    to = to * block.stride[0] + 1
+        self._output_scale = (out_channels // (patch_size ** 2), (ts, hs * patch_size, ws * patch_size), to)
+
         self.timestep_conditioning = timestep_conditioning
 
         if timestep_conditioning:
@@ -478,11 +505,15 @@ class Decoder(nn.Module):
             )
 
 
-    # def forward(self, sample: torch.FloatTensor, target_shape) -> torch.FloatTensor:
+    def decode_output_shape(self, input_shape):
+        c, (ts, hs, ws), to = self._output_scale
+        return (input_shape[0], c, input_shape[2] * ts - to, input_shape[3] * hs, input_shape[4] * ws)
+
     def forward_orig(
         self,
         sample: torch.FloatTensor,
         timestep: Optional[torch.Tensor] = None,
+        output_buffer: Optional[torch.Tensor] = None,
     ) -> torch.FloatTensor:
         r"""The forward method of the `Decoder` class."""
         batch_size = sample.shape[0]
@@ -524,9 +555,18 @@ class Decoder(nn.Module):
             )
             timestep_shift_scale = ada_values.unbind(dim=1)
 
-        output = []
+        if output_buffer is None:
+            output_buffer = torch.empty(
+                self.decode_output_shape(sample.shape),
+                dtype=sample.dtype, device=comfy.model_management.intermediate_device(),
+            )
+        output_offset = [0]
 
-        def run_up(idx, sample, ended):
+        max_chunk_size = get_max_chunk_size(sample.device)
+
+        def run_up(idx, sample_ref, ended):
+            sample = sample_ref[0]
+            sample_ref[0] = None
             if idx >= len(self.up_blocks):
                 sample = self.conv_norm_out(sample)
                 if timestep_shift_scale is not None:
@@ -537,7 +577,10 @@ class Decoder(nn.Module):
                     mark_conv3d_ended(self.conv_out)
                 sample = self.conv_out(sample, causal=self.causal)
                 if sample is not None and sample.shape[2] > 0:
-                    output.append(sample.to(comfy.model_management.intermediate_device()))
+                    sample = unpatchify(sample, patch_size_hw=self.patch_size, patch_size_t=1)
+                    t = sample.shape[2]
+                    output_buffer[:, :, output_offset[0]:output_offset[0] + t].copy_(sample)
+                    output_offset[0] += t
                 return
 
             up_block = self.up_blocks[idx]
@@ -554,18 +597,23 @@ class Decoder(nn.Module):
                 return
 
             total_bytes = sample.numel() * sample.element_size()
-            num_chunks = (total_bytes + MAX_CHUNK_SIZE - 1) // MAX_CHUNK_SIZE
-            samples = torch.chunk(sample, chunks=num_chunks, dim=2)
+            num_chunks = (total_bytes + max_chunk_size - 1) // max_chunk_size
 
-            for chunk_idx, sample1 in enumerate(samples):
-                run_up(idx + 1, sample1, ended and chunk_idx == len(samples) - 1)
+            if num_chunks == 1:
+                # when we are not chunking, detach our x so the callee can free it as soon as they are done
+                next_sample_ref = [sample]
+                del sample
+                run_up(idx + 1, next_sample_ref, ended)
+                return
+            else:
+                samples = torch.chunk(sample, chunks=num_chunks, dim=2)
 
-        run_up(0, sample, True)
-        sample = torch.cat(output, dim=2)
+                for chunk_idx, sample1 in enumerate(samples):
+                    run_up(idx + 1, [sample1], ended and chunk_idx == len(samples) - 1)
 
-        sample = unpatchify(sample, patch_size_hw=self.patch_size, patch_size_t=1)
+        run_up(0, [sample], True)
 
-        return sample
+        return output_buffer
 
     def forward(self, *args, **kwargs):
         try:
@@ -1199,7 +1247,10 @@ class VideoVAE(nn.Module):
         means, logvar = torch.chunk(self.encoder(x), 2, dim=1)
         return self.per_channel_statistics.normalize(means)
 
-    def decode(self, x):
+    def decode_output_shape(self, input_shape):
+        return self.decoder.decode_output_shape(input_shape)
+
+    def decode(self, x, output_buffer=None):
         if self.timestep_conditioning: #TODO: seed
             x = torch.randn_like(x) * self.decode_noise_scale + (1.0 - self.decode_noise_scale) * x
-        return self.decoder(self.per_channel_statistics.un_normalize(x), timestep=self.decode_timestep)
+        return self.decoder(self.per_channel_statistics.un_normalize(x), timestep=self.decode_timestep, output_buffer=output_buffer)
